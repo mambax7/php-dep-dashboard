@@ -63,6 +63,10 @@ function render(data) {
 
     <div class="filter-section">
       <h3>Namespace</h3>
+      <div class="namespace-actions">
+        <button class="btn btn--sm" id="ns-select-all">All</button>
+        <button class="btn btn--sm" id="ns-deselect-all">None</button>
+      </div>
       <div class="namespace-filters">
         ${namespaces
           .map(
@@ -101,6 +105,18 @@ function bindEvents() {
     }
 
     if (target.dataset.filter) {
+      applyFilters();
+    }
+  });
+
+  filtersEl.addEventListener('click', (e) => {
+    const target = e.target;
+
+    if (target.id === 'ns-select-all' || target.id === 'ns-deselect-all') {
+      const checked = target.id === 'ns-select-all';
+      filtersEl
+        .querySelectorAll('input[data-filter="namespace"]')
+        .forEach((cb) => { cb.checked = checked; });
       applyFilters();
     }
   });

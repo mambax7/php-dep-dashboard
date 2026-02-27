@@ -454,6 +454,12 @@ body {
   accent-color: var(--accent);
 }
 
+.namespace-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
 .namespace-filters {
   max-height: 200px;
   overflow-y: auto;
