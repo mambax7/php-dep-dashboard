@@ -1,6 +1,16 @@
 import { emit, on, state } from './state.js';
+import {
+  buildNamespaceElementsAtScope,
+  initNamespaceBrowser,
+  navigateToScope,
+  getCurrentScope,
+} from './namespace-browser.js';
 
 let cy = null;
+
+// Above this threshold, only the top N most-connected internal nodes are added
+// to Cytoscape to prevent the initial render from freezing.
+const MAX_RENDERED_NODES = 2000;
 
 const NODE_COLORS = {
   class: '#3B82F6',
@@ -24,7 +34,9 @@ const EDGE_STYLES = {
 };
 
 export function initGraph(data) {
-  const elements = buildElements(data);
+  initNamespaceBrowser(data);
+
+  const elements = buildNamespaceElementsAtScope(data, []);
 
   cy = cytoscape({
     container: document.getElementById('cy'),
@@ -38,15 +50,15 @@ export function initGraph(data) {
 
   state.cy = cy;
 
-  // Hide external nodes by default
-  cy.nodes('[?external]').hide();
+  cy.ready(() => runLayout('fcose'));
 
-  // Run layout
-  runLayout('fcose');
-
-  // Events
   cy.on('tap', 'node', (evt) => {
     const node = evt.target;
+    const d = node.data();
+    if (d.nodeType === 'namespace') {
+      navigateToScope(d.nsPath);
+      return;
+    }
     emit('node:selected', node.id());
   });
 
@@ -55,10 +67,9 @@ export function initGraph(data) {
     emit('edge:selected', {
       source: edge.data('source'),
       target: edge.data('target'),
-      type: edge.data('edgeType'),
+      weight: edge.data('weight'),
       confidence: edge.data('confidence'),
-      file: edge.data('file'),
-      line: edge.data('line'),
+      entries: edge.data('entries'),
     });
   });
 
@@ -88,6 +99,19 @@ export function initGraph(data) {
   on('focus:reset', () => resetFocus());
   on('layout:run', (name) => runLayout(name));
 
+  on('namespace:rebuild', () => {
+    if (!cy || !state.data) return;
+    const scope = getCurrentScope();
+    const els = buildNamespaceElementsAtScope(state.data, scope);
+    cy.startBatch();
+    cy.elements().remove();
+    cy.add(els);
+    cy.endBatch();
+    state.selectedNode = null;
+    if (state.cycles && state.cycles.length > 0) markCycleNodes(state.cycles);
+    runLayout('fcose');
+  });
+
   emit('graph:ready', cy);
 }
 
@@ -95,7 +119,33 @@ function buildElements(data) {
   const nodes = [];
   const edges = [];
 
+  // Compute degree (in + out) for each node from the raw edge list
+  const degree = new Map();
+  for (const e of data.edges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1);
+    degree.set(e.target, (degree.get(e.target) || 0) + 1);
+  }
+
+  // Determine which internal nodes to render (cap for large datasets)
+  const internalNodes = [...data.classes.values()].filter((c) => !c.external);
+  let allowedFQCNs = null; // null = all allowed
+
+  if (internalNodes.length > MAX_RENDERED_NODES) {
+    const sorted = [...internalNodes].sort(
+      (a, b) => (degree.get(b.fqcn) || 0) - (degree.get(a.fqcn) || 0)
+    );
+    allowedFQCNs = new Set(sorted.slice(0, MAX_RENDERED_NODES).map((c) => c.fqcn));
+
+    const banner = document.getElementById('large-dataset-banner');
+    banner.textContent = `Large dataset: displaying top ${MAX_RENDERED_NODES} of ${internalNodes.length} most-connected nodes. Filter by namespace to explore specific subgraphs.`;
+    banner.removeAttribute('hidden');
+  }
+
   for (const [fqcn, cls] of data.classes) {
+    // Skip external nodes (hidden by default anyway) and capped internal nodes
+    if (cls.external) continue;
+    if (allowedFQCNs && !allowedFQCNs.has(fqcn)) continue;
+
     const shortName = fqcn.split('\\').pop();
     nodes.push({
       data: {
@@ -113,17 +163,38 @@ function buildElements(data) {
     });
   }
 
-  for (let i = 0; i < data.edges.length; i++) {
-    const e = data.edges[i];
+  const renderedIds = new Set(nodes.map((n) => n.data.id));
+
+  // Consolidate parallel edges
+  const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
+  const edgeMap = new Map();
+  for (const e of data.edges) {
+    // Only include edges where both endpoints are rendered
+    if (!renderedIds.has(e.source) || !renderedIds.has(e.target)) continue;
+    const key = `${e.source}\u2192${e.target}`;
+    if (!edgeMap.has(key)) {
+      edgeMap.set(key, { source: e.source, target: e.target, entries: [] });
+    }
+    edgeMap.get(key).entries.push(e);
+  }
+
+  let i = 0;
+  for (const group of edgeMap.values()) {
+    const { source, target, entries } = group;
+    const best = entries.reduce((a, b) =>
+      (CONFIDENCE_RANK[b.confidence] || 0) > (CONFIDENCE_RANK[a.confidence] || 0) ? b : a
+    );
     edges.push({
       data: {
-        id: `e${i}`,
-        source: e.source,
-        target: e.target,
-        edgeType: e.type,
-        confidence: e.confidence,
-        file: e.file,
-        line: e.line,
+        id: `e${i++}`,
+        source,
+        target,
+        weight: entries.length,
+        edgeType: entries.map((e) => e.type).join(', '),
+        confidence: best.confidence,
+        file: best.file,
+        line: best.line,
+        entries,
       },
     });
   }
@@ -132,8 +203,7 @@ function buildElements(data) {
 }
 
 function buildStylesheet() {
-  const styles = [
-    // Base node style
+  return [
     {
       selector: 'node',
       style: {
@@ -153,7 +223,6 @@ function buildStylesheet() {
         'transition-duration': '200ms',
       },
     },
-    // Node types
     ...Object.entries(NODE_COLORS).map(([type, color]) => ({
       selector: `node[type="${type}"]`,
       style: {
@@ -161,7 +230,6 @@ function buildStylesheet() {
         shape: NODE_SHAPES[type],
       },
     })),
-    // External nodes
     {
       selector: 'node[?external]',
       style: {
@@ -170,7 +238,6 @@ function buildStylesheet() {
         'border-color': '#6B7280',
       },
     },
-    // Cycle nodes
     {
       selector: 'node.in-cycle',
       style: {
@@ -178,7 +245,6 @@ function buildStylesheet() {
         'border-width': 3,
       },
     },
-    // Dimmed (focus mode)
     {
       selector: 'node.dimmed',
       style: { opacity: 0.15 },
@@ -187,7 +253,6 @@ function buildStylesheet() {
       selector: 'edge.dimmed',
       style: { opacity: 0.15 },
     },
-    // Highlighted node
     {
       selector: 'node.highlighted',
       style: {
@@ -195,11 +260,10 @@ function buildStylesheet() {
         'border-width': 4,
       },
     },
-    // Base edge style
     {
       selector: 'edge',
       style: {
-        width: 1,
+        width: 1.5,
         'line-color': '#94A3B8',
         'target-arrow-color': '#94A3B8',
         'target-arrow-shape': 'triangle',
@@ -209,15 +273,12 @@ function buildStylesheet() {
         'transition-duration': '200ms',
       },
     },
-    // Edge confidence styles
     ...Object.entries(EDGE_STYLES).map(([confidence, s]) => ({
       selector: `edge[confidence="${confidence}"]`,
       style: {
-        width: s.width,
         'line-style': s.style,
       },
     })),
-    // Edge hover colors
     {
       selector: 'edge.edge-out',
       style: {
@@ -234,7 +295,6 @@ function buildStylesheet() {
         width: 2,
       },
     },
-    // Search highlight
     {
       selector: 'node.search-match',
       style: {
@@ -242,43 +302,100 @@ function buildStylesheet() {
         'border-width': 4,
       },
     },
+    {
+      selector: 'node[nodeType="namespace"]',
+      style: {
+        'background-color': '#0F4C81',
+        'background-opacity': 0.95,
+        shape: 'roundrectangle',
+        width: 'mapData(classCount, 1, 80, 70, 160)',
+        height: 'mapData(classCount, 1, 80, 70, 160)',
+        label: 'data(label)',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'font-size': 13,
+        'font-weight': 600,
+        'text-wrap': 'wrap',
+        'text-max-width': '140px',
+        'text-outline-width': 0,
+        color: '#E2E8F0',
+        'border-color': '#3B82F6',
+        'border-width': 2,
+        cursor: 'pointer',
+        'transition-property': 'border-color, border-width, background-color',
+        'transition-duration': '150ms',
+      },
+    },
+    {
+      selector: 'node[nodeType="namespace"]:active',
+      style: {
+        'background-color': '#1E4D8C',
+        'border-color': '#60A5FA',
+        'border-width': 3,
+      },
+    },
+    {
+      selector: 'node[nodeType="namespace"][?hasCycle]',
+      style: {
+        'border-color': '#EF4444',
+        'border-width': 3,
+      },
+    },
   ];
-
-  return styles;
 }
 
 export function runLayout(name) {
   if (!cy) return;
 
+  const visibleEles = cy.elements(':visible');
+  if (visibleEles.length === 0) return;
+
+  const visibleNodeCount = visibleEles.nodes().length;
+
+  // For very large visible graphs, fall back to grid (instant, non-blocking)
+  if (visibleNodeCount > 1500) {
+    visibleEles.layout({ name: 'grid', animate: false, fit: true, padding: 40 }).run();
+    return;
+  }
+
+  // For medium graphs, use fcose/cose but without animation and fewer iterations
+  const large = visibleNodeCount > 500;
+
   const options =
     name === 'fcose'
       ? {
           name: 'fcose',
-          animate: true,
-          animationDuration: 500,
-          quality: 'default',
+          animate: !large,
+          animationDuration: large ? 0 : 500,
+          fit: true,
+          padding: 40,
+          quality: large ? 'draft' : 'default',
           nodeDimensionsIncludeLabels: true,
           idealEdgeLength: 120,
           nodeRepulsion: 8000,
           edgeElasticity: 0.45,
           gravity: 0.25,
           gravityRange: 3.8,
-          numIter: 2500,
+          numIter: large ? 500 : 2500,
           tile: true,
           packComponents: true,
         }
       : {
           name: 'cose',
-          animate: true,
-          animationDuration: 500,
+          animate: !large,
+          animationDuration: large ? 0 : 500,
+          fit: true,
+          padding: 40,
           nodeDimensionsIncludeLabels: true,
           idealEdgeLength: 120,
           nodeRepulsion: 8000,
         };
 
-  const visibleEles = cy.elements(':visible');
-  if (visibleEles.length > 0) {
+  try {
     visibleEles.layout(options).run();
+  } catch (e) {
+    console.warn('Layout "' + name + '" failed, falling back to grid:', e.message);
+    visibleEles.layout({ name: 'grid', animate: false, fit: true, padding: 40 }).run();
   }
 }
 

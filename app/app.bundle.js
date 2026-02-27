@@ -24,6 +24,131 @@ const state = {
 };
 
 // ── data-loader.js ───────────────────────────────────────────
+
+// Inline worker code — runs JSON.parse + data processing off the main thread.
+// Uses String.fromCharCode(92) for backslash to avoid template-literal escaping issues.
+const WORKER_CODE = `
+  var SEP = String.fromCharCode(92);
+
+  function getNamespaceKey(fqcn, isExternal) {
+    var parts = fqcn.split(SEP);
+    if (parts.length < 2) return parts[0];
+    return isExternal ? parts[0] : parts.slice(0, 2).join(SEP);
+  }
+
+  function detectCycles(edges, nodeCount) {
+    if (nodeCount > 3000) return [];
+    var adj = new Map();
+    for (var i = 0; i < edges.length; i++) {
+      var e = edges[i];
+      if (!adj.has(e.source)) adj.set(e.source, []);
+      adj.get(e.source).push(e.target);
+    }
+    var visited = new Set();
+    var inStack = new Set();
+    var cycles = [];
+    var MAX_CYCLES = 50;
+
+    function dfs(node, path) {
+      if (cycles.length >= MAX_CYCLES) return;
+      if (inStack.has(node)) {
+        var cycleStart = path.indexOf(node);
+        if (cycleStart !== -1) cycles.push(path.slice(cycleStart));
+        return;
+      }
+      if (visited.has(node)) return;
+      visited.add(node);
+      inStack.add(node);
+      path.push(node);
+      var neighbors = adj.get(node) || [];
+      for (var i = 0; i < neighbors.length; i++) dfs(neighbors[i], path);
+      path.pop();
+      inStack.delete(node);
+    }
+
+    var nodes = Array.from(adj.keys());
+    for (var i = 0; i < nodes.length; i++) {
+      if (!visited.has(nodes[i])) dfs(nodes[i], []);
+    }
+    return cycles;
+  }
+
+  self.onmessage = function(e) {
+    try {
+      var raw = JSON.parse(e.data);
+      var seen = new Set(raw.classes.map(function(c) { return c.fqcn; }));
+      var classesArray = raw.classes.map(function(cls) {
+        return Object.assign({}, cls, {
+          external: false,
+          namespace: getNamespaceKey(cls.fqcn, false),
+        });
+      });
+      for (var i = 0; i < raw.edges.length; i++) {
+        var edge = raw.edges[i];
+        var fqcns = [edge.source, edge.target];
+        for (var j = 0; j < fqcns.length; j++) {
+          var fqcn = fqcns[j];
+          if (!seen.has(fqcn)) {
+            seen.add(fqcn);
+            classesArray.push({
+              fqcn: fqcn, type: 'class', file: null, line: null,
+              dependencies: [], dependants: [],
+              external: true,
+              namespace: getNamespaceKey(fqcn, true),
+            });
+          }
+        }
+      }
+      var nodeCount = (raw.meta && raw.meta.node_count) || raw.classes.length;
+      var cycles = detectCycles(raw.edges, nodeCount);
+      self.postMessage({ ok: true, classesArray: classesArray, edges: raw.edges, meta: raw.meta, warnings: raw.warnings || [], cycles: cycles });
+    } catch(err) {
+      self.postMessage({ ok: false, error: err.message });
+    }
+  };
+`;
+
+function parseAndProcessInWorker(text) {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    const worker = new Worker(url);
+    worker.onmessage = (e) => {
+      URL.revokeObjectURL(url);
+      worker.terminate();
+      if (e.data.ok) {
+        resolve(processWorkerResult(e.data));
+      } else {
+        reject(new Error(e.data.error));
+      }
+    };
+    worker.onerror = (err) => {
+      URL.revokeObjectURL(url);
+      worker.terminate();
+      reject(new Error(err.message || 'Worker error'));
+    };
+    worker.postMessage(text);
+  });
+}
+
+function processWorkerResult({ classesArray, edges, meta, warnings, cycles }) {
+  const classMap = new Map(classesArray.map((cls) => [cls.fqcn, cls]));
+
+  const processed = { meta, classes: classMap, edges, warnings, cycles };
+
+  state.data = processed;
+  state.cycles = cycles;
+  emit('data:loaded', processed);
+
+  if (meta && meta.node_count > 200) {
+    const banner = document.getElementById('large-dataset-banner');
+    banner.textContent = `Large dataset (${meta.node_count} nodes). Use namespace filters for better performance.`;
+    banner.removeAttribute('hidden');
+  }
+
+  return processed;
+}
+
 async function loadData() {
   if (sessionStorage.getItem('forceFilePicker')) {
     sessionStorage.removeItem('forceFilePicker');
@@ -32,8 +157,8 @@ async function loadData() {
   try {
     const res = await fetch('data.json');
     if (!res.ok) throw new Error(res.statusText);
-    const data = await res.json();
-    return processData(data);
+    const text = await res.text();
+    return await parseAndProcessInWorker(text);
   } catch {
     return waitForFilePicker();
   }
@@ -57,11 +182,11 @@ function waitForFilePicker() {
 
     function handleFile(file) {
       const reader = new FileReader();
-      reader.onload = (e) => {
+      reader.onload = async (e) => {
         try {
-          const data = JSON.parse(e.target.result);
+          const processed = await parseAndProcessInWorker(e.target.result);
           hideDropZone();
-          resolve(processData(data));
+          resolve(processed);
         } catch {
           zone.querySelector('.drop-zone__error').textContent = 'Invalid JSON file.';
         }
@@ -86,109 +211,202 @@ function waitForFilePicker() {
   });
 }
 
-function processData(raw) {
-  const internalFQCNs = new Set(raw.classes.map((c) => c.fqcn));
-  const classMap = new Map();
-
-  for (const cls of raw.classes) {
-    classMap.set(cls.fqcn, {
-      ...cls,
-      external: false,
-      namespace: getNamespaceKey(cls.fqcn, false),
-    });
-  }
-
-  for (const edge of raw.edges) {
-    for (const fqcn of [edge.source, edge.target]) {
-      if (!classMap.has(fqcn)) {
-        classMap.set(fqcn, {
-          fqcn,
-          type: 'class',
-          file: null,
-          line: null,
-          dependencies: [],
-          dependants: [],
-          external: true,
-          namespace: getNamespaceKey(fqcn, true),
-        });
-      }
-    }
-  }
-
-  const cycles = detectCycles(raw.edges);
-
-  const processed = {
-    meta: raw.meta,
-    classes: classMap,
-    edges: raw.edges,
-    warnings: raw.warnings || [],
-    cycles,
-  };
-
-  state.data = processed;
-  state.cycles = cycles;
-  emit('data:loaded', processed);
-
-  if (raw.meta.node_count > 200) {
-    const banner = document.getElementById('large-dataset-banner');
-    banner.textContent = `Large dataset (${raw.meta.node_count} nodes). Use namespace filters for better performance.`;
-    banner.removeAttribute('hidden');
-  }
-
-  return processed;
-}
-
 function getNamespaceKey(fqcn, isExternal) {
   const parts = fqcn.split('\\');
   if (parts.length < 2) return parts[0];
   return isExternal ? parts[0] : parts.slice(0, 2).join('\\');
 }
 
-function detectCycles(edges) {
-  const adj = new Map();
-  for (const e of edges) {
-    if (!adj.has(e.source)) adj.set(e.source, []);
-    adj.get(e.source).push(e.target);
+// ── namespace-browser.js ─────────────────────────────────────
+let currentScope = [];
+let nsData = null;
+
+function buildNamespaceElementsAtScope(data, scope) {
+  const SEP = '\\';
+  const nodes = [];
+  const edges = [];
+
+  const degree = new Map();
+  for (const e of data.edges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1);
+    degree.set(e.target, (degree.get(e.target) || 0) + 1);
   }
 
-  const visited = new Set();
-  const inStack = new Set();
-  const cycles = [];
+  const allClasses = [...data.classes.values()].filter((c) => !c.external);
 
-  function dfs(node, path) {
-    if (inStack.has(node)) {
-      const cycleStart = path.indexOf(node);
-      if (cycleStart !== -1) {
-        cycles.push(path.slice(cycleStart));
+  // Map: segment → { isFolder: bool, fqcns: Set<string> }
+  const childInfo = new Map();
+
+  for (const cls of allClasses) {
+    const parts = cls.fqcn.split(SEP);
+
+    if (scope.length > 0) {
+      if (parts.length <= scope.length) continue;
+      let match = true;
+      for (let i = 0; i < scope.length; i++) {
+        if (parts[i] !== scope[i]) { match = false; break; }
       }
-      return;
-    }
-    if (visited.has(node)) return;
-
-    visited.add(node);
-    inStack.add(node);
-    path.push(node);
-
-    const neighbors = adj.get(node) || [];
-    for (const neighbor of neighbors) {
-      dfs(neighbor, path);
+      if (!match) continue;
     }
 
-    path.pop();
-    inStack.delete(node);
-  }
+    const segment = parts[scope.length];
+    if (segment === undefined) continue;
 
-  for (const node of adj.keys()) {
-    if (!visited.has(node)) {
-      dfs(node, []);
+    if (!childInfo.has(segment)) {
+      childInfo.set(segment, { isFolder: false, fqcns: new Set() });
+    }
+    childInfo.get(segment).fqcns.add(cls.fqcn);
+
+    if (parts.length > scope.length + 1) {
+      childInfo.get(segment).isFolder = true;
     }
   }
 
-  return cycles;
+  const cycleSet = new Set((state.cycles || []).flat());
+  const fqcnToNodeId = new Map();
+  const prefix = scope.length > 0 ? scope.join(SEP) + SEP : '';
+
+  for (const [segment, info] of childInfo) {
+    const nsPath = prefix + segment;
+
+    if (info.isFolder) {
+      const nodeId = 'ns::' + nsPath;
+      for (const fqcn of info.fqcns) fqcnToNodeId.set(fqcn, nodeId);
+
+      const hasCycle = [...info.fqcns].some((fqcn) => cycleSet.has(fqcn));
+      nodes.push({
+        data: {
+          id: nodeId,
+          label: segment + '\n' + info.fqcns.size + (info.fqcns.size === 1 ? ' class' : ' classes'),
+          nodeType: 'namespace',
+          nsPath,
+          classCount: info.fqcns.size,
+          hasCycle,
+        },
+      });
+    } else {
+      const fqcn = [...info.fqcns][0];
+      const cls = data.classes.get(fqcn);
+      fqcnToNodeId.set(fqcn, fqcn);
+      nodes.push({
+        data: {
+          id: fqcn,
+          label: fqcn.split(SEP).pop(),
+          fullLabel: fqcn,
+          type: cls.type,
+          nodeType: 'class',
+          external: false,
+          namespace: cls.namespace,
+          file: cls.file,
+          line: cls.line,
+          depCount: cls.dependencies ? cls.dependencies.length : 0,
+          dependantCount: cls.dependants ? cls.dependants.length : 0,
+          degree: degree.get(fqcn) || 0,
+        },
+      });
+    }
+  }
+
+  const renderedNodeIds = new Set(nodes.map((n) => n.data.id));
+  const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
+  const edgeMap = new Map();
+
+  for (const e of data.edges) {
+    const srcId = fqcnToNodeId.get(e.source);
+    const tgtId = fqcnToNodeId.get(e.target);
+    if (!srcId || !tgtId || srcId === tgtId) continue;
+    if (!renderedNodeIds.has(srcId) || !renderedNodeIds.has(tgtId)) continue;
+    const key = srcId + '\u2192' + tgtId;
+    if (!edgeMap.has(key)) edgeMap.set(key, { source: srcId, target: tgtId, entries: [] });
+    edgeMap.get(key).entries.push(e);
+  }
+
+  let ei = 0;
+  for (const group of edgeMap.values()) {
+    const { source, target, entries } = group;
+    const best = entries.reduce((a, b) =>
+      (CONFIDENCE_RANK[b.confidence] || 0) > (CONFIDENCE_RANK[a.confidence] || 0) ? b : a
+    );
+    edges.push({
+      data: {
+        id: 'e' + ei++,
+        source,
+        target,
+        weight: entries.length,
+        confidence: best.confidence,
+        edgeType: entries.map((e) => e.type).join(', '),
+        entries,
+      },
+    });
+  }
+
+  return [...nodes, ...edges];
+}
+
+function navigateToScope(nsPath) {
+  currentScope = nsPath ? nsPath.split('\\') : [];
+  renderBreadcrumb();
+  emit('selection:cleared');
+  rebuildGraphForScope();
+}
+
+function renderBreadcrumb() {
+  const el = document.getElementById('ns-breadcrumb');
+  if (!el) return;
+
+  const parts = currentScope;
+  const items = [];
+
+  if (parts.length === 0) {
+    items.push('<span class="breadcrumb-item breadcrumb-item--current">root</span>');
+  } else {
+    items.push('<span class="breadcrumb-item" data-scope="">root</span>');
+  }
+
+  for (let i = 0; i < parts.length; i++) {
+    const sc = parts.slice(0, i + 1).join('\\');
+    items.push('<span class="breadcrumb-sep">›</span>');
+    if (i === parts.length - 1) {
+      items.push('<span class="breadcrumb-item breadcrumb-item--current">' + escHtml(parts[i]) + '</span>');
+    } else {
+      items.push('<span class="breadcrumb-item" data-scope="' + escHtml(sc) + '">' + escHtml(parts[i]) + '</span>');
+    }
+  }
+
+  el.innerHTML = items.join('');
+  el.querySelectorAll('.breadcrumb-item[data-scope]').forEach((item) => {
+    item.addEventListener('click', () => navigateToScope(item.dataset.scope));
+  });
+}
+
+function escHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function rebuildGraphForScope() {
+  if (!nsData || !state.cy) return;
+  const elements = buildNamespaceElementsAtScope(nsData, currentScope);
+  state.cy.startBatch();
+  state.cy.elements().remove();
+  state.cy.add(elements);
+  state.cy.endBatch();
+  state.selectedNode = null;
+  if (state.cycles && state.cycles.length > 0) markCycleNodes(state.cycles);
+  runLayout('fcose');
+}
+
+function initNamespaceBrowser(data) {
+  nsData = data;
+  currentScope = [];
+  renderBreadcrumb();
 }
 
 // ── graph-renderer.js ────────────────────────────────────────
 let cy = null;
+
+// Above this threshold, only the top N most-connected internal nodes are added
+// to Cytoscape to prevent the initial render from freezing.
+const MAX_RENDERED_NODES = 2000;
 
 const NODE_COLORS = {
   class: '#3B82F6',
@@ -212,7 +430,9 @@ const EDGE_STYLES = {
 };
 
 function initGraph(data) {
-  const elements = buildElements(data);
+  initNamespaceBrowser(data);
+
+  const elements = buildNamespaceElementsAtScope(data, []);
 
   cy = cytoscape({
     container: document.getElementById('cy'),
@@ -226,12 +446,15 @@ function initGraph(data) {
 
   state.cy = cy;
 
-  cy.nodes('[?external]').hide();
-
   cy.ready(() => runLayout('fcose'));
 
   cy.on('tap', 'node', (evt) => {
     const node = evt.target;
+    const d = node.data();
+    if (d.nodeType === 'namespace') {
+      navigateToScope(d.nsPath);
+      return;
+    }
     emit('node:selected', node.id());
   });
 
@@ -240,10 +463,9 @@ function initGraph(data) {
     emit('edge:selected', {
       source: edge.data('source'),
       target: edge.data('target'),
-      type: edge.data('edgeType'),
+      weight: edge.data('weight'),
       confidence: edge.data('confidence'),
-      file: edge.data('file'),
-      line: edge.data('line'),
+      entries: edge.data('entries'),
     });
   });
 
@@ -280,7 +502,32 @@ function buildElements(data) {
   const nodes = [];
   const edges = [];
 
+  // Compute degree (in + out) for each node from the raw edge list
+  const degree = new Map();
+  for (const e of data.edges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1);
+    degree.set(e.target, (degree.get(e.target) || 0) + 1);
+  }
+
+  // Determine which internal nodes to render (cap for large datasets)
+  const internalNodes = [...data.classes.values()].filter((c) => !c.external);
+  let allowedFQCNs = null; // null = all allowed
+
+  if (internalNodes.length > MAX_RENDERED_NODES) {
+    const sorted = [...internalNodes].sort(
+      (a, b) => (degree.get(b.fqcn) || 0) - (degree.get(a.fqcn) || 0)
+    );
+    allowedFQCNs = new Set(sorted.slice(0, MAX_RENDERED_NODES).map((c) => c.fqcn));
+
+    const banner = document.getElementById('large-dataset-banner');
+    banner.textContent = `Large dataset: displaying top ${MAX_RENDERED_NODES} of ${internalNodes.length} most-connected nodes. Filter by namespace to explore specific subgraphs.`;
+    banner.removeAttribute('hidden');
+  }
+
   for (const [fqcn, cls] of data.classes) {
+    if (cls.external) continue;
+    if (allowedFQCNs && !allowedFQCNs.has(fqcn)) continue;
+
     const shortName = fqcn.split('\\').pop();
     nodes.push({
       data: {
@@ -298,17 +545,36 @@ function buildElements(data) {
     });
   }
 
-  for (let i = 0; i < data.edges.length; i++) {
-    const e = data.edges[i];
+  const renderedIds = new Set(nodes.map((n) => n.data.id));
+
+  const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
+  const edgeMap = new Map();
+  for (const e of data.edges) {
+    if (!renderedIds.has(e.source) || !renderedIds.has(e.target)) continue;
+    const key = `${e.source}\u2192${e.target}`;
+    if (!edgeMap.has(key)) {
+      edgeMap.set(key, { source: e.source, target: e.target, entries: [] });
+    }
+    edgeMap.get(key).entries.push(e);
+  }
+
+  let i = 0;
+  for (const group of edgeMap.values()) {
+    const { source, target, entries } = group;
+    const best = entries.reduce((a, b) =>
+      (CONFIDENCE_RANK[b.confidence] || 0) > (CONFIDENCE_RANK[a.confidence] || 0) ? b : a
+    );
     edges.push({
       data: {
-        id: `e${i}`,
-        source: e.source,
-        target: e.target,
-        edgeType: e.type,
-        confidence: e.confidence,
-        file: e.file,
-        line: e.line,
+        id: `e${i++}`,
+        source,
+        target,
+        weight: entries.length,
+        edgeType: entries.map((e) => e.type).join(', '),
+        confidence: best.confidence,
+        file: best.file,
+        line: best.line,
+        entries,
       },
     });
   }
@@ -377,7 +643,7 @@ function buildStylesheet() {
     {
       selector: 'edge',
       style: {
-        width: 1,
+        width: 1.5,
         'line-color': '#94A3B8',
         'target-arrow-color': '#94A3B8',
         'target-arrow-shape': 'triangle',
@@ -390,7 +656,6 @@ function buildStylesheet() {
     ...Object.entries(EDGE_STYLES).map(([confidence, s]) => ({
       selector: `edge[confidence="${confidence}"]`,
       style: {
-        width: s.width,
         'line-style': s.style,
       },
     })),
@@ -417,35 +682,80 @@ function buildStylesheet() {
         'border-width': 4,
       },
     },
+    {
+      selector: 'node[nodeType="namespace"]',
+      style: {
+        'background-color': '#0F4C81',
+        'background-opacity': 0.95,
+        shape: 'roundrectangle',
+        width: 'mapData(classCount, 1, 80, 70, 160)',
+        height: 'mapData(classCount, 1, 80, 70, 160)',
+        label: 'data(label)',
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'font-size': 13,
+        'font-weight': 600,
+        'text-wrap': 'wrap',
+        'text-max-width': '140px',
+        'text-outline-width': 0,
+        color: '#E2E8F0',
+        'border-color': '#3B82F6',
+        'border-width': 2,
+        cursor: 'pointer',
+        'transition-property': 'border-color, border-width, background-color',
+        'transition-duration': '150ms',
+      },
+    },
+    {
+      selector: 'node[nodeType="namespace"][?hasCycle]',
+      style: {
+        'border-color': '#EF4444',
+        'border-width': 3,
+      },
+    },
   ];
 }
 
 function runLayout(name) {
   if (!cy) return;
 
+  const visibleEles = cy.elements(':visible');
+  if (visibleEles.length === 0) return;
+
+  const visibleNodeCount = visibleEles.nodes().length;
+
+  // For very large visible graphs, fall back to grid (instant, non-blocking)
+  if (visibleNodeCount > 1500) {
+    visibleEles.layout({ name: 'grid', animate: false, fit: true, padding: 40 }).run();
+    return;
+  }
+
+  // For medium graphs, use fcose/cose but without animation and fewer iterations
+  const large = visibleNodeCount > 500;
+
   const options =
     name === 'fcose'
       ? {
           name: 'fcose',
-          animate: true,
-          animationDuration: 500,
+          animate: !large,
+          animationDuration: large ? 0 : 500,
           fit: true,
           padding: 40,
-          quality: 'default',
+          quality: large ? 'draft' : 'default',
           nodeDimensionsIncludeLabels: true,
           idealEdgeLength: 120,
           nodeRepulsion: 8000,
           edgeElasticity: 0.45,
           gravity: 0.25,
           gravityRange: 3.8,
-          numIter: 2500,
+          numIter: large ? 500 : 2500,
           tile: true,
           packComponents: true,
         }
       : {
           name: 'cose',
-          animate: true,
-          animationDuration: 500,
+          animate: !large,
+          animationDuration: large ? 0 : 500,
           fit: true,
           padding: 40,
           nodeDimensionsIncludeLabels: true,
@@ -453,14 +763,11 @@ function runLayout(name) {
           nodeRepulsion: 8000,
         };
 
-  const visibleEles = cy.elements(':visible');
-  if (visibleEles.length === 0) return;
-
   try {
     visibleEles.layout(options).run();
   } catch (e) {
-    console.warn('Layout "' + name + '" failed, falling back to cose:', e.message);
-    visibleEles.layout({ name: 'cose', animate: true, fit: true, padding: 40 }).run();
+    console.warn('Layout "' + name + '" failed, falling back to grid:', e.message);
+    visibleEles.layout({ name: 'grid', animate: false, fit: true, padding: 40 }).run();
   }
 }
 
@@ -641,6 +948,13 @@ function applyFilters() {
 
   state.cy.nodes().forEach((node) => {
     const d = node.data();
+
+    // Namespace folder nodes are always visible — they're navigational
+    if (d.nodeType === 'namespace') {
+      node.show();
+      return;
+    }
+
     const typeMatch = activeTypes.has(d.type);
     const nsMatch = activeNamespaces.has(d.namespace);
     const externalMatch = d.external ? showExternal : true;
@@ -795,17 +1109,29 @@ function renderNode(nodeId) {
 }
 
 function renderEdge(edgeData) {
+  const { source, target, weight, entries = [] } = edgeData;
+  const label = weight > 1 ? `${weight} dependencies` : '1 dependency';
+
   panelEl.innerHTML = `
     <div class="detail-header">
       <span class="chip">edge</span>
-      <span class="edge-confidence conf--${edgeData.confidence}">${edgeData.confidence}</span>
+      <span class="chip">${label}</span>
     </div>
-    <h3 class="detail-title">${edgeData.type}</h3>
-    <p class="detail-file">${edgeData.file || 'unknown'}${edgeData.line ? ':' + edgeData.line : ''}</p>
+    <p class="detail-file"><strong>From:</strong> ${source}</p>
+    <p class="detail-file"><strong>To:</strong> ${target}</p>
+
+    ${entries.length > 0 ? `
     <div class="detail-section">
-      <p><strong>From:</strong> ${edgeData.source}</p>
-      <p><strong>To:</strong> ${edgeData.target}</p>
-    </div>
+      <h4>Dependencies (${entries.length})</h4>
+      <ul class="detail-list">
+        ${entries.map((e) => `
+          <li class="detail-list-item">
+            <span class="edge-type">${e.type}</span>
+            <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
+          </li>
+        `).join('')}
+      </ul>
+    </div>` : ''}
   `;
 }
 
@@ -960,15 +1286,28 @@ function renderSearchResults(matches) {
   searchResultsEl.querySelectorAll('.search-item').forEach((li) => {
     li.addEventListener('click', () => {
       const fqcn = li.dataset.fqcn;
-      emit('node:selected', fqcn);
       clearSearch();
 
-      if (state.cy) {
-        const node = state.cy.getElementById(fqcn);
-        if (node && !node.empty()) {
-          if (!node.visible()) node.show();
-          state.cy.animate({ center: { eles: node }, duration: 300 });
-        }
+      const cy = state.cy;
+      if (!cy) return;
+
+      const node = cy.getElementById(fqcn);
+      if (node && !node.empty()) {
+        if (!node.visible()) node.show();
+        cy.animate({ center: { eles: node }, duration: 300 });
+        emit('node:selected', fqcn);
+      } else {
+        // Node is inside a collapsed namespace — navigate to its scope
+        const parts = fqcn.split('\\');
+        const scopePath = parts.slice(0, -1).join('\\');
+        navigateToScope(scopePath);
+        setTimeout(() => {
+          const n = cy.getElementById(fqcn);
+          if (n && !n.empty()) {
+            cy.animate({ center: { eles: n }, duration: 400 });
+            emit('node:selected', fqcn);
+          }
+        }, 600);
       }
     });
   });

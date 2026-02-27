@@ -1,4 +1,5 @@
 import { emit, on, state } from './state.js';
+import { navigateToScope } from './namespace-browser.js';
 
 let inputEl;
 let resultsEl;
@@ -88,18 +89,30 @@ function renderResults(matches) {
   resultsEl.querySelectorAll('.search-item').forEach((li) => {
     li.addEventListener('click', () => {
       const fqcn = li.dataset.fqcn;
-      emit('node:selected', fqcn);
       clearSearch();
 
-      // Center on node
       const cy = state.cy;
-      if (cy) {
-        const node = cy.getElementById(fqcn);
-        if (node && !node.empty()) {
-          // Show if hidden
-          if (!node.visible()) node.show();
-          cy.animate({ center: { eles: node }, duration: 300 });
-        }
+      if (!cy) return;
+
+      const node = cy.getElementById(fqcn);
+      if (node && !node.empty()) {
+        // Node is already in the current view
+        if (!node.visible()) node.show();
+        cy.animate({ center: { eles: node }, duration: 300 });
+        emit('node:selected', fqcn);
+      } else {
+        // Node is inside a collapsed namespace — navigate to its scope
+        const parts = fqcn.split('\\');
+        const scopePath = parts.slice(0, -1).join('\\');
+        navigateToScope(scopePath);
+        // Wait for rebuild + layout, then center and select
+        setTimeout(() => {
+          const n = cy.getElementById(fqcn);
+          if (n && !n.empty()) {
+            cy.animate({ center: { eles: n }, duration: 400 });
+            emit('node:selected', fqcn);
+          }
+        }, 600);
       }
     });
   });

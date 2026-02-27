@@ -134,6 +134,13 @@ function applyFilters() {
   // Filter nodes
   cy.nodes().forEach((node) => {
     const d = node.data();
+
+    // Namespace folder nodes are always visible — they're navigational
+    if (d.nodeType === 'namespace') {
+      node.show();
+      return;
+    }
+
     const typeMatch = activeTypes.has(d.type);
     const nsMatch = activeNamespaces.has(d.namespace);
     const externalMatch = d.external ? showExternal : true;
