@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "version": "1.0",
+    "generated_at": "2026-02-26T10:00:00+00:00",
+    "analyzed_path": "/path/to/project",
+    "file_count": 42,
+    "class_count": 38,
+    "node_count": 95,
+    "edge_count": 312,
+    "warning_count": 2
+  },
+  "classes": [
+    {
+      "fqcn": "App\\Service\\UserService",
+      "type": "class",
+      "file": "/path/to/UserService.php",
+      "line": 12,
+      "dependencies": ["App\\Repository\\UserRepository", "Psr\\Log\\LoggerInterface"],
+      "dependants": ["App\\Controller\\UserController"]
+    }
+  ],
+  "edges": [
+    {
+      "source": "App\\Service\\UserService",
+      "target": "App\\Repository\\UserRepository",
+      "type": "param_type",
+      "confidence": "certain",
+      "file": "/path/to/UserService.php",
+      "line": 23,
+      "metadata": {}
+    }
+  ],
+  "warnings": [
+    {
+      "type": "dynamic_instantiation",
+      "file": "/path/to/Factory.php",
+      "line": 45,
+      "message": "Dynamic instantiation: new $variable()"
+    }
+  ]
+}

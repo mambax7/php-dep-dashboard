@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PHP Dependency Insights</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar__left">
+      <h1 class="topbar__title">PHP Dep Insights</h1>
+      <div id="meta-stats" class="topbar__meta"></div>
+    </div>
+    <div class="topbar__center">
+      <div class="search-wrapper">
+        <input type="text" id="search-input" placeholder="Search class..." autocomplete="off">
+        <div id="search-results" class="search-results"></div>
+      </div>
+    </div>
+    <div class="topbar__right">
+      <button id="btn-new-analysis" class="btn btn--ghost" hidden>New analysis</button>
+      <button id="warnings-badge" class="btn btn--ghost">No warnings</button>
+      <div id="warnings-list" class="warnings-dropdown"></div>
+    </div>
+  </header>
+
+  <!-- Main layout -->
+  <div class="main-layout">
+
+    <!-- Left sidebar: filters -->
+    <aside class="sidebar sidebar--left" id="sidebar-left">
+      <div id="filters" class="filters"></div>
+    </aside>
+
+    <!-- Graph container -->
+    <main class="graph-area">
+      <div id="cy"></div>
+      <div id="large-dataset-banner" class="large-dataset-banner" hidden></div>
+
+      <!-- Loading overlay -->
+      <div id="loading" class="loading-overlay">
+        <div class="loading-spinner"></div>
+        <p>Loading graph...</p>
+      </div>
+
+      <!-- Drop zone (fallback for file:// protocol) -->
+      <div id="drop-zone" class="drop-zone">
+        <div class="drop-zone__content">
+          <p class="drop-zone__title">Drop your data.json here</p>
+          <p class="drop-zone__sub">or click to browse</p>
+          <p class="drop-zone__hint">Drop your <code>data.json</code> or click to browse</p>
+          <p class="drop-zone__error"></p>
+          <input type="file" accept=".json" hidden>
+        </div>
+      </div>
+    </main>
+
+    <!-- Right sidebar: detail panel -->
+    <aside class="sidebar sidebar--right" id="sidebar-right">
+      <div id="detail-panel" class="detail-panel"></div>
+    </aside>
+
+  </div>
+
+  <!-- Vendor scripts (loaded before modules) -->
+  <script src="vendor/cytoscape.min.js"></script>
+  <script src="vendor/layout-base.min.js"></script>
+  <script src="vendor/cose-base.min.js"></script>
+  <script src="vendor/cytoscape-fcose.min.js"></script>
+
+  <!-- App entry point (bundled, works with file:// protocol) -->
+  <script src="app/app.bundle.js"></script>
+
+</body>
+</html>
