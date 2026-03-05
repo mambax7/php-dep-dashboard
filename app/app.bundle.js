@@ -428,7 +428,7 @@ function buildNamespaceElementsAtScope(data, scope) {
 
 /**
  * Build Cytoscape elements showing all individual classes at the given scope,
- * without grouping into namespace folders.
+ * grouped into namespace compound-node containers for visual highlighting.
  */
 function buildClassElementsAtScope(data, scope) {
   const SEP = '\\';
@@ -443,6 +443,8 @@ function buildClassElementsAtScope(data, scope) {
 
   const allClasses = [...data.classes.values()].filter((c) => !c.external);
 
+  // Filter to classes under current scope
+  const scopedClasses = [];
   for (const cls of allClasses) {
     if (scope.length > 0) {
       const parts = cls.fqcn.split(SEP);
@@ -453,26 +455,55 @@ function buildClassElementsAtScope(data, scope) {
       }
       if (!match) continue;
     }
+    scopedClasses.push(cls);
+  }
 
+  // Collect unique namespace paths (FQCN parts except the class name)
+  const nsSet = new Set();
+  for (const cls of scopedClasses) {
+    const parts = cls.fqcn.split(SEP);
+    const nsPath = parts.slice(0, -1).join(SEP);
+    if (nsPath) nsSet.add(nsPath);
+  }
+
+  // Add namespace container nodes first (compound node parents must come before children)
+  for (const nsPath of nsSet) {
+    const parts = nsPath.split(SEP);
+    // Show path relative to current scope
+    const label = parts.slice(scope.length).join(SEP) || parts[parts.length - 1];
     nodes.push({
       data: {
-        id: cls.fqcn,
-        label: cls.fqcn.split(SEP).pop(),
-        fullLabel: cls.fqcn,
-        type: cls.type,
-        nodeType: 'class',
-        external: false,
-        namespace: cls.namespace,
-        file: cls.file,
-        line: cls.line,
-        depCount: cls.dependencies ? cls.dependencies.length : 0,
-        dependantCount: cls.dependants ? cls.dependants.length : 0,
-        degree: degree.get(cls.fqcn) || 0,
+        id: 'ns-container::' + nsPath,
+        label,
+        nodeType: 'namespace-container',
+        nsPath,
       },
     });
   }
 
-  const renderedIds = new Set(nodes.map((n) => n.data.id));
+  // Add class nodes as children of their namespace container
+  for (const cls of scopedClasses) {
+    const parts = cls.fqcn.split(SEP);
+    const nsPath = parts.slice(0, -1).join(SEP);
+    const nodeData = {
+      id: cls.fqcn,
+      label: parts[parts.length - 1],
+      fullLabel: cls.fqcn,
+      type: cls.type,
+      nodeType: 'class',
+      external: false,
+      namespace: cls.namespace,
+      file: cls.file,
+      line: cls.line,
+      depCount: cls.dependencies ? cls.dependencies.length : 0,
+      dependantCount: cls.dependants ? cls.dependants.length : 0,
+      degree: degree.get(cls.fqcn) || 0,
+    };
+    if (nsPath) nodeData.parent = 'ns-container::' + nsPath;
+    nodes.push({ data: nodeData });
+  }
+
+  const renderedIds = new Set(scopedClasses.map((c) => c.fqcn));
   const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
   const edgeMap = new Map();
 
@@ -919,6 +950,25 @@ function buildStylesheet() {
       },
     },
     {
+      selector: 'node[nodeType="namespace-container"]',
+      style: {
+        'background-color': '#1E3A5F',
+        'background-opacity': 0.35,
+        'border-color': '#3B82F6',
+        'border-width': 1,
+        'border-opacity': 0.6,
+        shape: 'roundrectangle',
+        label: 'data(label)',
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'font-size': 11,
+        'font-weight': 700,
+        color: '#93C5FD',
+        'text-outline-width': 0,
+        padding: 20,
+      },
+    },
+    {
       selector: 'node[nodeType="namespace"]',
       style: {
         'background-color': '#0F4C81',
@@ -1218,8 +1268,8 @@ function applyFilters() {
   cy.nodes().forEach((node) => {
     const d = node.data();
 
-    // Namespace folder nodes are always visible — they're navigational
-    if (d.nodeType === 'namespace') {
+    // Namespace folder/container nodes are always visible — they're navigational
+    if (d.nodeType === 'namespace' || d.nodeType === 'namespace-container') {
       node.show();
       return;
     }
