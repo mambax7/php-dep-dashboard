@@ -458,19 +458,20 @@ function buildClassElementsAtScope(data, scope) {
     scopedClasses.push(cls);
   }
 
-  // Collect unique namespace paths (FQCN parts except the class name)
+  // Group by the first sub-namespace segment after the current scope.
+  // Classes sitting directly at scope level get no container.
   const nsSet = new Set();
   for (const cls of scopedClasses) {
     const parts = cls.fqcn.split(SEP);
-    const nsPath = parts.slice(0, -1).join(SEP);
-    if (nsPath) nsSet.add(nsPath);
+    if (parts.length > scope.length + 1) {
+      nsSet.add(parts.slice(0, scope.length + 1).join(SEP));
+    }
   }
 
   // Add namespace container nodes first (compound node parents must come before children)
   for (const nsPath of nsSet) {
     const parts = nsPath.split(SEP);
-    // Show path relative to current scope
-    const label = parts.slice(scope.length).join(SEP) || parts[parts.length - 1];
+    const label = parts[scope.length]; // one-segment label, e.g. "Commands"
     nodes.push({
       data: {
         id: 'ns-container::' + nsPath,
@@ -484,7 +485,9 @@ function buildClassElementsAtScope(data, scope) {
   // Add class nodes as children of their namespace container
   for (const cls of scopedClasses) {
     const parts = cls.fqcn.split(SEP);
-    const nsPath = parts.slice(0, -1).join(SEP);
+    const nsPath = parts.length > scope.length + 1
+      ? parts.slice(0, scope.length + 1).join(SEP)
+      : null;
     const nodeData = {
       id: cls.fqcn,
       label: parts[parts.length - 1],
