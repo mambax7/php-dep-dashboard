@@ -3,7 +3,52 @@
 // Works with file:// protocol (no server needed).
 // ============================================================
 
-// ── state.js ─────────────────────────────────────────────────
+// ── constants.js ─────────────────────────────────────────
+const EVENTS = {
+  DATA_LOADED: 'data:loaded',
+  NODE_SELECTED: 'node:selected',
+  EDGE_SELECTED: 'edge:selected',
+  SELECTION_CLEARED: 'selection:cleared',
+  FOCUS_NODE: 'focus:node',
+  FOCUS_RESET: 'focus:reset',
+  LAYOUT_RUN: 'layout:run',
+  FILTERS_APPLIED: 'filters:applied',
+  NAMESPACE_REBUILD: 'namespace:rebuild',
+  GRAPH_READY: 'graph:ready',
+};
+
+const DOM = {
+  CY: 'cy',
+  FILTERS: 'filters',
+  DETAIL_PANEL: 'detail-panel',
+  NS_BREADCRUMB: 'ns-breadcrumb',
+  NS_PANEL: 'ns-panel',
+  SEARCH_INPUT: 'search-input',
+  SEARCH_RESULTS: 'search-results',
+  WARNINGS_BADGE: 'warnings-badge',
+  WARNINGS_LIST: 'warnings-list',
+  META_STATS: 'meta-stats',
+  LOADING: 'loading',
+  LARGE_DATASET_BANNER: 'large-dataset-banner',
+  GRAPH_STATUS: 'graph-status',
+  BTN_NEW_ANALYSIS: 'btn-new-analysis',
+  DROP_ZONE: 'drop-zone',
+  LAYOUT_SELECT: 'layout-select',
+  NS_SELECT_ALL: 'ns-select-all',
+  NS_DESELECT_ALL: 'ns-deselect-all',
+  NS_SEARCH: 'ns-search',
+  FILTER_EXTERNAL: 'filter-external',
+  BTN_RESET_FOCUS: 'btn-reset-focus',
+  BTN_EXPORT_PNG: 'btn-export-png',
+};
+
+const NODE_TYPE = {
+  NAMESPACE: 'namespace',
+  CLASS: 'class',
+};
+
+
+// ── state.js ─────────────────────────────────────────────
 const bus = new EventTarget();
 
 function emit(name, detail) {
@@ -14,6 +59,7 @@ function on(name, handler) {
   bus.addEventListener(name, (e) => handler(e.detail));
 }
 
+// Shared application state
 const state = {
   data: null,
   cy: null,
@@ -23,7 +69,8 @@ const state = {
   filtersActive: false,
 };
 
-// ── data-loader.js ───────────────────────────────────────────
+
+// ── data-loader.js ───────────────────────────────────────
 
 // Inline worker code — runs JSON.parse + data processing off the main thread.
 // Uses String.fromCharCode(92) for backslash to avoid template-literal escaping issues.
@@ -149,6 +196,9 @@ function processWorkerResult({ classesArray, edges, meta, warnings, cycles }) {
   return processed;
 }
 
+/**
+ * Try fetch, fallback to file picker UI.
+ */
 async function loadData() {
   if (sessionStorage.getItem('forceFilePicker')) {
     sessionStorage.removeItem('forceFilePicker');
@@ -211,35 +261,63 @@ function waitForFilePicker() {
   });
 }
 
+/**
+ * Get namespace key: first 2 segments for internal, first segment for external.
+ */
 function getNamespaceKey(fqcn, isExternal) {
   const parts = fqcn.split('\\');
   if (parts.length < 2) return parts[0];
   return isExternal ? parts[0] : parts.slice(0, 2).join('\\');
 }
 
-// ── namespace-browser.js ─────────────────────────────────────
-let currentScope = [];
+
+// ── namespace-browser.js ─────────────────────────────────
+
+let currentScope = []; // array of namespace segments, e.g. ['App', 'Services']
+let viewMode = 'folders'; // 'folders' | 'classes'
 let nsData = null;
 
+function getViewMode() {
+  return viewMode;
+}
+
+function setViewMode(mode) {
+  viewMode = mode;
+  renderBreadcrumb();
+  emit('selection:cleared');
+  emit('namespace:rebuild');
+}
+
+/**
+ * Build Cytoscape elements for the given scope level.
+ *
+ * At scope [] (root): one node per top-level namespace segment.
+ * At scope ['App']: one node per child of App (sub-namespace folders or leaf classes).
+ * Edges are aggregated between nodes at the current scope level.
+ */
 function buildNamespaceElementsAtScope(data, scope) {
   const SEP = '\\';
   const nodes = [];
   const edges = [];
 
+  // Degree for class node sizing
   const degree = new Map();
   for (const e of data.edges) {
     degree.set(e.source, (degree.get(e.source) || 0) + 1);
     degree.set(e.target, (degree.get(e.target) || 0) + 1);
   }
 
+  // Only internal classes
   const allClasses = [...data.classes.values()].filter((c) => !c.external);
 
+  // Group classes by their child segment at this scope level
   // Map: segment → { isFolder: bool, fqcns: Set<string> }
   const childInfo = new Map();
 
   for (const cls of allClasses) {
     const parts = cls.fqcn.split(SEP);
 
+    // Skip if not under current scope
     if (scope.length > 0) {
       if (parts.length <= scope.length) continue;
       let match = true;
@@ -257,12 +335,16 @@ function buildNamespaceElementsAtScope(data, scope) {
     }
     childInfo.get(segment).fqcns.add(cls.fqcn);
 
+    // If there are more parts, this segment is a namespace folder
     if (parts.length > scope.length + 1) {
       childInfo.get(segment).isFolder = true;
     }
   }
 
+  // Cycle detection: which FQCNs are in cycles?
   const cycleSet = new Set((state.cycles || []).flat());
+
+  // Build fqcn → nodeId mapping for edge aggregation
   const fqcnToNodeId = new Map();
   const prefix = scope.length > 0 ? scope.join(SEP) + SEP : '';
 
@@ -307,6 +389,7 @@ function buildNamespaceElementsAtScope(data, scope) {
     }
   }
 
+  // Build aggregated edges
   const renderedNodeIds = new Set(nodes.map((n) => n.data.id));
   const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
   const edgeMap = new Map();
@@ -343,11 +426,94 @@ function buildNamespaceElementsAtScope(data, scope) {
   return [...nodes, ...edges];
 }
 
+/**
+ * Build Cytoscape elements showing all individual classes at the given scope,
+ * without grouping into namespace folders.
+ */
+function buildClassElementsAtScope(data, scope) {
+  const SEP = '\\';
+  const nodes = [];
+  const edges = [];
+
+  const degree = new Map();
+  for (const e of data.edges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1);
+    degree.set(e.target, (degree.get(e.target) || 0) + 1);
+  }
+
+  const allClasses = [...data.classes.values()].filter((c) => !c.external);
+
+  for (const cls of allClasses) {
+    if (scope.length > 0) {
+      const parts = cls.fqcn.split(SEP);
+      if (parts.length <= scope.length) continue;
+      let match = true;
+      for (let i = 0; i < scope.length; i++) {
+        if (parts[i] !== scope[i]) { match = false; break; }
+      }
+      if (!match) continue;
+    }
+
+    nodes.push({
+      data: {
+        id: cls.fqcn,
+        label: cls.fqcn.split(SEP).pop(),
+        fullLabel: cls.fqcn,
+        type: cls.type,
+        nodeType: 'class',
+        external: false,
+        namespace: cls.namespace,
+        file: cls.file,
+        line: cls.line,
+        depCount: cls.dependencies ? cls.dependencies.length : 0,
+        dependantCount: cls.dependants ? cls.dependants.length : 0,
+        degree: degree.get(cls.fqcn) || 0,
+      },
+    });
+  }
+
+  const renderedIds = new Set(nodes.map((n) => n.data.id));
+  const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
+  const edgeMap = new Map();
+
+  for (const e of data.edges) {
+    if (!renderedIds.has(e.source) || !renderedIds.has(e.target)) continue;
+    const key = e.source + '\u2192' + e.target;
+    if (!edgeMap.has(key)) edgeMap.set(key, { source: e.source, target: e.target, entries: [] });
+    edgeMap.get(key).entries.push(e);
+  }
+
+  let ei = 0;
+  for (const group of edgeMap.values()) {
+    const { source, target, entries } = group;
+    const best = entries.reduce((a, b) =>
+      (CONFIDENCE_RANK[b.confidence] || 0) > (CONFIDENCE_RANK[a.confidence] || 0) ? b : a
+    );
+    edges.push({
+      data: {
+        id: 'e' + ei++,
+        source,
+        target,
+        weight: entries.length,
+        confidence: best.confidence,
+        edgeType: entries.map((e) => e.type).join(', '),
+        entries,
+      },
+    });
+  }
+
+  return [...nodes, ...edges];
+}
+
 function navigateToScope(nsPath) {
   currentScope = nsPath ? nsPath.split('\\') : [];
   renderBreadcrumb();
   emit('selection:cleared');
-  rebuildGraphForScope();
+  emit('namespace:rebuild');
+}
+
+function getCurrentScope() {
+  return currentScope;
 }
 
 function renderBreadcrumb() {
@@ -367,32 +533,36 @@ function renderBreadcrumb() {
     const sc = parts.slice(0, i + 1).join('\\');
     items.push('<span class="breadcrumb-sep">›</span>');
     if (i === parts.length - 1) {
-      items.push('<span class="breadcrumb-item breadcrumb-item--current">' + escHtml(parts[i]) + '</span>');
+      items.push(
+        '<span class="breadcrumb-item breadcrumb-item--current">' + escHtml(parts[i]) + '</span>'
+      );
     } else {
-      items.push('<span class="breadcrumb-item" data-scope="' + escHtml(sc) + '">' + escHtml(parts[i]) + '</span>');
+      items.push(
+        '<span class="breadcrumb-item" data-scope="' + escHtml(sc) + '">' + escHtml(parts[i]) + '</span>'
+      );
     }
   }
 
-  el.innerHTML = items.join('');
+  const isClassMode = viewMode === 'classes';
+  const toggleLabel = isClassMode ? 'Namespaces' : 'Classes';
+  const toggleTitle = isClassMode ? 'Afficher par namespaces' : 'Afficher toutes les classes';
+
+  el.innerHTML =
+    '<span class="breadcrumb-path">' + items.join('') + '</span>' +
+    '<button class="view-mode-toggle' + (isClassMode ? ' view-mode-toggle--active' : '') +
+    '" id="view-mode-toggle" title="' + toggleTitle + '">' + toggleLabel + '</button>';
+
   el.querySelectorAll('.breadcrumb-item[data-scope]').forEach((item) => {
     item.addEventListener('click', () => navigateToScope(item.dataset.scope));
+  });
+
+  el.querySelector('#view-mode-toggle').addEventListener('click', () => {
+    setViewMode(viewMode === 'folders' ? 'classes' : 'folders');
   });
 }
 
 function escHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function rebuildGraphForScope() {
-  if (!nsData || !state.cy) return;
-  const elements = buildNamespaceElementsAtScope(nsData, currentScope);
-  state.cy.startBatch();
-  state.cy.elements().remove();
-  state.cy.add(elements);
-  state.cy.endBatch();
-  state.selectedNode = null;
-  if (state.cycles && state.cycles.length > 0) markCycleNodes(state.cycles);
-  runLayout('fcose');
 }
 
 function initNamespaceBrowser(data) {
@@ -401,7 +571,9 @@ function initNamespaceBrowser(data) {
   renderBreadcrumb();
 }
 
-// ── graph-renderer.js ────────────────────────────────────────
+
+// ── graph-renderer.js ────────────────────────────────────
+
 let cy = null;
 
 // Above this threshold, only the top N most-connected internal nodes are added
@@ -509,7 +681,39 @@ function initGraph(data) {
   on('focus:reset', () => resetFocus());
   on('layout:run', (name) => runLayout(name));
 
+  on('namespace:rebuild', () => {
+    if (!cy || !state.data) return;
+    const scope = getCurrentScope();
+    const els = getViewMode() === 'classes'
+      ? buildClassElementsAtScope(state.data, scope)
+      : buildNamespaceElementsAtScope(state.data, scope);
+    cy.startBatch();
+    cy.elements().remove();
+    cy.add(els);
+    cy.endBatch();
+    state.selectedNode = null;
+    if (state.cycles && state.cycles.length > 0) markCycleNodes(state.cycles);
+    runLayout('fcose');
+  });
+
+  const btnExport = document.getElementById('btn-export-png');
+  if (btnExport) {
+    btnExport.removeAttribute('hidden');
+    btnExport.addEventListener('click', exportPng);
+  }
+
   emit('graph:ready', cy);
+}
+
+function exportPng() {
+  if (!cy) return;
+  const dataUrl = cy.png({ output: 'blob', bg: '#0F172A', full: true, scale: 2 });
+  const url = URL.createObjectURL(dataUrl);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'php-dep-graph.png';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function buildElements(data) {
@@ -539,6 +743,7 @@ function buildElements(data) {
   }
 
   for (const [fqcn, cls] of data.classes) {
+    // Skip external nodes (hidden by default anyway) and capped internal nodes
     if (cls.external) continue;
     if (allowedFQCNs && !allowedFQCNs.has(fqcn)) continue;
 
@@ -561,9 +766,11 @@ function buildElements(data) {
 
   const renderedIds = new Set(nodes.map((n) => n.data.id));
 
+  // Consolidate parallel edges
   const CONFIDENCE_RANK = { certain: 4, high: 3, medium: 2, low: 1 };
   const edgeMap = new Map();
   for (const e of data.edges) {
+    // Only include edges where both endpoints are rendered
     if (!renderedIds.has(e.source) || !renderedIds.has(e.target)) continue;
     const key = `${e.source}\u2192${e.target}`;
     if (!edgeMap.has(key)) {
@@ -735,6 +942,14 @@ function buildStylesheet() {
         'transition-duration': '150ms',
       },
     },
+    {
+      selector: 'node[nodeType="namespace"]:active',
+      style: {
+        'background-color': '#1E4D8C',
+        'border-color': '#60A5FA',
+        'border-width': 3,
+      },
+    },
   ];
 }
 
@@ -839,18 +1054,20 @@ function markCycleNodes(cycles) {
   cy.endBatch();
 }
 
-// ── filter-manager.js ────────────────────────────────────────
+
+// ── filter-manager.js ────────────────────────────────────
+
 let filtersEl;
 let namespaces = [];
 
 function initFilters(data) {
   filtersEl = document.getElementById('filters');
   namespaces = collectNamespaces(data);
-  renderFilters(data);
-  bindFilterEvents();
+  render(data);
+  bindEvents();
   on('data:loaded', (d) => {
     namespaces = collectNamespaces(d);
-    renderFilters(d);
+    render(d);
   });
 }
 
@@ -862,7 +1079,7 @@ function collectNamespaces(data) {
   return [...nsSet].sort();
 }
 
-function renderFilters(data) {
+function render(data) {
   const types = ['class', 'interface', 'trait', 'enum'];
   const confidences = ['certain', 'high', 'medium', 'low'];
 
@@ -930,7 +1147,7 @@ function renderFilters(data) {
   `;
 }
 
-function bindFilterEvents() {
+function bindEvents() {
   filtersEl.addEventListener('change', (e) => {
     const target = e.target;
 
@@ -973,29 +1190,32 @@ function bindFilterEvents() {
 }
 
 function toggleExternal(show) {
-  if (!state.cy) return;
-  state.cy.startBatch();
-  const externals = state.cy.nodes('[?external]');
+  const cy = state.cy;
+  if (!cy) return;
+  cy.startBatch();
+  const externals = cy.nodes('[?external]');
   if (show) {
     externals.show();
   } else {
     externals.hide();
   }
-  state.cy.endBatch();
+  cy.endBatch();
   emit('layout:run', document.getElementById('layout-select').value);
 }
 
 function applyFilters() {
-  if (!state.cy) return;
+  const cy = state.cy;
+  if (!cy) return;
 
   const activeTypes = getCheckedValues('type');
   const activeConfidences = getCheckedValues('confidence');
   const activeNamespaces = getCheckedValues('namespace');
   const showExternal = document.getElementById('filter-external').checked;
 
-  state.cy.startBatch();
+  cy.startBatch();
 
-  state.cy.nodes().forEach((node) => {
+  // Filter nodes
+  cy.nodes().forEach((node) => {
     const d = node.data();
 
     // Namespace folder nodes are always visible — they're navigational
@@ -1015,7 +1235,8 @@ function applyFilters() {
     }
   });
 
-  state.cy.edges().forEach((edge) => {
+  // Filter edges by confidence and visibility of endpoints
+  cy.edges().forEach((edge) => {
     const confMatch = activeConfidences.has(edge.data('confidence'));
     const srcVisible = edge.source().visible();
     const tgtVisible = edge.target().visible();
@@ -1027,7 +1248,7 @@ function applyFilters() {
     }
   });
 
-  state.cy.endBatch();
+  cy.endBatch();
   state.filtersActive = true;
   emit('filters:applied');
 }
@@ -1039,7 +1260,9 @@ function getCheckedValues(filterName) {
   return new Set([...checks].map((c) => c.value));
 }
 
-// ── detail-panel.js ──────────────────────────────────────────
+
+// ── detail-panel.js ──────────────────────────────────────
+
 let panelEl;
 
 function initDetailPanel() {
@@ -1066,6 +1289,7 @@ function renderNode(nodeId) {
   const cls = data.classes.get(nodeId);
   if (!cls) return;
 
+  // Compute in/out edges, deduplicated by target/source
   const outEdges = deduplicateEdges(
     data.edges.filter((e) => e.source === nodeId), 'target'
   );
@@ -1073,8 +1297,10 @@ function renderNode(nodeId) {
     data.edges.filter((e) => e.target === nodeId), 'source'
   );
 
+  // Check if in cycle
   const inCycle = state.cycles.some((c) => c.includes(nodeId));
 
+  // Focus the node on the graph
   emit('focus:node', { nodeId, depth: state.focusDepth });
 
   panelEl.innerHTML = `
@@ -1113,7 +1339,7 @@ function renderNode(nodeId) {
         ${outEdges.map((e) => `
           <li class="detail-list-item" data-fqcn="${e.target}">
             <span class="edge-type">${e.type}</span>
-            <span class="edge-target">${panelShortName(e.target)}</span>
+            <span class="edge-target">${shortName(e.target)}</span>
             <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
           </li>
         `).join('')}
@@ -1127,7 +1353,7 @@ function renderNode(nodeId) {
         ${inEdges.map((e) => `
           <li class="detail-list-item" data-fqcn="${e.source}">
             <span class="edge-type">${e.type}</span>
-            <span class="edge-target">${panelShortName(e.source)}</span>
+            <span class="edge-target">${shortName(e.source)}</span>
             <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
           </li>
         `).join('')}
@@ -1135,6 +1361,7 @@ function renderNode(nodeId) {
     </div>` : ''}
   `;
 
+  // Bind depth buttons
   panelEl.querySelectorAll('[data-depth]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const depth = parseInt(btn.dataset.depth, 10);
@@ -1144,6 +1371,7 @@ function renderNode(nodeId) {
     });
   });
 
+  // Reset focus button
   const resetBtn = panelEl.querySelector('#btn-reset-focus');
   if (resetBtn) {
     resetBtn.addEventListener('click', () => {
@@ -1153,6 +1381,7 @@ function renderNode(nodeId) {
     });
   }
 
+  // Click on dep/dependant to navigate
   panelEl.querySelectorAll('.detail-list-item').forEach((li) => {
     li.addEventListener('click', () => {
       const fqcn = li.dataset.fqcn;
@@ -1162,36 +1391,25 @@ function renderNode(nodeId) {
 }
 
 function renderEdge(edgeData) {
-  const { source, target, weight, entries = [] } = edgeData;
-  const label = weight > 1 ? `${weight} dependencies` : '1 dependency';
-
   panelEl.innerHTML = `
     <div class="detail-header">
       <span class="chip">edge</span>
-      <span class="chip">${label}</span>
+      <span class="edge-confidence conf--${edgeData.confidence}">${edgeData.confidence}</span>
     </div>
-    <p class="detail-file"><strong>From:</strong> ${source}</p>
-    <p class="detail-file"><strong>To:</strong> ${target}</p>
-
-    ${entries.length > 0 ? `
+    <h3 class="detail-title">${edgeData.type}</h3>
+    <p class="detail-file">${edgeData.file || 'unknown'}${edgeData.line ? ':' + edgeData.line : ''}</p>
     <div class="detail-section">
-      <h4>Dependencies (${entries.length})</h4>
-      <ul class="detail-list">
-        ${entries.map((e) => `
-          <li class="detail-list-item">
-            <span class="edge-type">${e.type}</span>
-            <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
-          </li>
-        `).join('')}
-      </ul>
-    </div>` : ''}
+      <p><strong>From:</strong> ${edgeData.source}</p>
+      <p><strong>To:</strong> ${edgeData.target}</p>
+    </div>
   `;
 }
 
-function panelShortName(fqcn) {
+function shortName(fqcn) {
   return fqcn.split('\\').pop();
 }
 
+// Merge edges that share the same key (target or source), combining their types
 function deduplicateEdges(edges, key) {
   const map = new Map();
   for (const e of edges) {
@@ -1208,7 +1426,9 @@ function deduplicateEdges(edges, key) {
   return Array.from(map.values());
 }
 
-// ── warnings-panel.js ────────────────────────────────────────
+
+// ── warnings-panel.js ────────────────────────────────────
+
 let badgeEl;
 let listEl;
 
@@ -1218,12 +1438,13 @@ function initWarnings(data) {
 
   const total = data.warnings.length + data.cycles.length;
   updateBadge(total);
-  renderWarningsList(data);
+  renderList(data);
 
   badgeEl.addEventListener('click', () => {
     listEl.classList.toggle('visible');
   });
 
+  // Close when clicking outside
   document.addEventListener('click', (e) => {
     if (!listEl.contains(e.target) && !badgeEl.contains(e.target)) {
       listEl.classList.remove('visible');
@@ -1240,7 +1461,7 @@ function updateBadge(count) {
   }
 }
 
-function renderWarningsList(data) {
+function renderList(data) {
   const items = [];
 
   for (const w of data.warnings) {
@@ -1257,7 +1478,7 @@ function renderWarningsList(data) {
     items.push(`
       <li class="warning-item warning-item--cycle">
         <span class="warning-type">circular dependency</span>
-        <span class="warning-message">${cycle.map(warningShortName).join(' -> ')} -> ${warningShortName(cycle[0])}</span>
+        <span class="warning-message">${cycle.map(shortName).join(' -> ')} -> ${shortName(cycle[0])}</span>
       </li>
     `);
   }
@@ -1267,34 +1488,37 @@ function renderWarningsList(data) {
     : '<p class="warnings-empty">No warnings detected.</p>';
 }
 
-function warningShortName(fqcn) {
+function shortName(fqcn) {
   return fqcn.split('\\').pop();
 }
 
-// ── search.js ────────────────────────────────────────────────
-let searchInputEl;
-let searchResultsEl;
+
+// ── search.js ────────────────────────────────────────────
+
+let inputEl;
+let resultsEl;
 
 function initSearch() {
-  searchInputEl = document.getElementById('search-input');
-  searchResultsEl = document.getElementById('search-results');
+  inputEl = document.getElementById('search-input');
+  resultsEl = document.getElementById('search-results');
 
-  searchInputEl.addEventListener('input', onSearchInput);
-  searchInputEl.addEventListener('keydown', (e) => {
+  inputEl.addEventListener('input', onInput);
+  inputEl.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       clearSearch();
     }
   });
 
+  // Close results on outside click
   document.addEventListener('click', (e) => {
-    if (!searchResultsEl.contains(e.target) && e.target !== searchInputEl) {
-      searchResultsEl.classList.remove('visible');
+    if (!resultsEl.contains(e.target) && e.target !== inputEl) {
+      resultsEl.classList.remove('visible');
     }
   });
 }
 
-function onSearchInput() {
-  const query = searchInputEl.value.trim().toLowerCase();
+function onInput() {
+  const query = inputEl.value.trim().toLowerCase();
   if (query.length < 2) {
     clearSearch();
     return;
@@ -1310,21 +1534,25 @@ function onSearchInput() {
     }
   }
 
+  // Sort by relevance (shorter = more specific match)
   matches.sort((a, b) => b.score - a.score);
 
-  if (state.cy) {
-    state.cy.nodes().removeClass('search-match');
-    state.cy.startBatch();
+  // Highlight on graph
+  const cy = state.cy;
+  if (cy) {
+    cy.nodes().removeClass('search-match');
+    cy.startBatch();
     for (const m of matches.slice(0, 20)) {
-      state.cy.getElementById(m.fqcn).addClass('search-match');
+      cy.getElementById(m.fqcn).addClass('search-match');
     }
-    state.cy.endBatch();
+    cy.endBatch();
   }
 
-  renderSearchResults(matches.slice(0, 15));
+  renderResults(matches.slice(0, 15));
 }
 
 function scoreMatch(fqcn, query) {
+  // Exact class name match scores highest
   const shortName = fqcn.split('\\').pop();
   if (shortName === query) return 100;
   if (shortName.startsWith(query)) return 80;
@@ -1333,26 +1561,26 @@ function scoreMatch(fqcn, query) {
   return 20;
 }
 
-function renderSearchResults(matches) {
+function renderResults(matches) {
   if (matches.length === 0) {
-    searchResultsEl.innerHTML = '<p class="search-empty">No results</p>';
-    searchResultsEl.classList.add('visible');
+    resultsEl.innerHTML = '<p class="search-empty">No results</p>';
+    resultsEl.classList.add('visible');
     return;
   }
 
-  searchResultsEl.innerHTML = `<ul class="search-list">${matches
+  resultsEl.innerHTML = `<ul class="search-list">${matches
     .map(
       (m) => `
       <li class="search-item" data-fqcn="${m.fqcn}">
         <span class="chip chip--${m.cls.type} chip--xs">${m.cls.type}</span>
-        <span>${highlightMatch(m.fqcn, searchInputEl.value.trim())}</span>
+        <span>${highlightMatch(m.fqcn, inputEl.value.trim())}</span>
       </li>`
     )
     .join('')}</ul>`;
 
-  searchResultsEl.classList.add('visible');
+  resultsEl.classList.add('visible');
 
-  searchResultsEl.querySelectorAll('.search-item').forEach((li) => {
+  resultsEl.querySelectorAll('.search-item').forEach((li) => {
     li.addEventListener('click', () => {
       const fqcn = li.dataset.fqcn;
       clearSearch();
@@ -1362,6 +1590,7 @@ function renderSearchResults(matches) {
 
       const node = cy.getElementById(fqcn);
       if (node && !node.empty()) {
+        // Node is already in the current view
         if (!node.visible()) node.show();
         cy.animate({ center: { eles: node }, duration: 300 });
         emit('node:selected', fqcn);
@@ -1370,6 +1599,7 @@ function renderSearchResults(matches) {
         const parts = fqcn.split('\\');
         const scopePath = parts.slice(0, -1).join('\\');
         navigateToScope(scopePath);
+        // Wait for rebuild + layout, then center and select
         setTimeout(() => {
           const n = cy.getElementById(fqcn);
           if (n && !n.empty()) {
@@ -1396,16 +1626,20 @@ function escapeHtml(str) {
 }
 
 function clearSearch() {
-  searchInputEl.value = '';
-  searchResultsEl.classList.remove('visible');
-  searchResultsEl.innerHTML = '';
-  if (state.cy) {
-    state.cy.nodes().removeClass('search-match');
+  inputEl.value = '';
+  resultsEl.classList.remove('visible');
+  resultsEl.innerHTML = '';
+  const cy = state.cy;
+  if (cy) {
+    cy.nodes().removeClass('search-match');
   }
 }
 
-// ── app.js ───────────────────────────────────────────────────
+
+// ── app.js ───────────────────────────────────────────────
+
 async function main() {
+  // Show loading state
   const loading = document.getElementById('loading');
   loading.classList.add('visible');
 
@@ -1414,22 +1648,27 @@ async function main() {
 
     loading.classList.remove('visible');
 
+    // Initialize all modules
     initGraph(data);
     initFilters(data);
     initDetailPanel();
     initWarnings(data);
     initSearch();
 
+    // Mark cycle nodes after graph is ready
     if (data.cycles.length > 0) {
       markCycleNodes(data.cycles);
     }
 
+    // Warn if dataset is large
     if (data.meta && data.meta.node_count > 200) {
       showLargeDatasetWarning(data.meta.node_count);
     }
 
+    // Update meta stats
     renderMeta(data.meta);
 
+    // Show new analysis button
     const btnNew = document.getElementById('btn-new-analysis');
     btnNew.removeAttribute('hidden');
     btnNew.addEventListener('click', () => {
@@ -1461,3 +1700,4 @@ function showLargeDatasetWarning(nodeCount) {
 }
 
 main();
+
