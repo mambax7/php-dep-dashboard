@@ -2,33 +2,30 @@
 
 A browser-based, interactive dependency graph explorer for PHP projects.
 
-## How it works
-
-Drop a `data.json` file produced by [php-dep](https://github.com/DeGraciaMathieu/php-dep) and get an interactive visualization of your PHP class dependencies, with namespace drill-down navigation, filters, and cycle detection.
-
-## Generating the data file
-
-Install and run [php-dep](https://github.com/DeGraciaMathieu/php-dep) on your PHP project:
+## Installation
 
 ```bash
-composer require --dev degraciamathieu/php-dep
+git clone https://github.com/DeGraciaMathieu/php-dep-dashboard
+cd php-dep-dashboard
+composer install
 ```
-
-```bash
-vendor/bin/php-dep analyse src/ --format=json > data.json
-```
-
-Then drop the generated `data.json` into the dashboard.
 
 ## Usage
 
-Open `index.html` in your browser (works via `file://`, no server needed).
+Run the `analyse` command with the path to your PHP project:
 
-On first load, a drop zone is shown — either:
-- Drop your `data.json` onto it, or
-- Click to open a file picker
+```bash
+bin/analyse ../my-project/src/
+```
 
-Once loaded, you can:
+This will:
+1. Run [php-dep](https://github.com/DeGraciaMathieu/php-dep) on the given path
+2. Generate `data.json` in the dashboard directory
+3. Open the dashboard in your browser
+
+## What you get
+
+Once the dashboard is open:
 
 - **Navigate namespaces** — click namespace nodes to drill down, use the breadcrumb to go back up
 - **Switch view modes** — toggle between folder view (one node per namespace) and class view (all individual classes, grouped by namespace)
@@ -38,3 +35,12 @@ Once loaded, you can:
 - **Cycles** — circular dependencies are highlighted in red; warnings are listed in the top-right badge
 - **Export** — export the current graph view as a PNG
 
+## Manual usage
+
+You can also generate `data.json` manually and drop it into the dashboard:
+
+```bash
+vendor/bin/php-dep analyse src/ --format=json > data.json
+```
+
+Then open `index.html` in your browser (works via `file://`, no server needed).
