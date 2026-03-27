@@ -20,8 +20,13 @@ bin/analyse ../my-project/src/
 
 This will:
 1. Run [php-dep](https://github.com/DeGraciaMathieu/php-dep) on the given path
-2. Generate `data.json` in the dashboard directory
-3. Open the dashboard in your browser
+2. Generate a `<folder-name>.json` file in the dashboard directory
+
+Add `--open` to automatically open the dashboard in your browser after analysis:
+
+```bash
+bin/analyse ../my-project/src/ --open
+```
 
 ## What you get
 
