@@ -543,6 +543,8 @@ body {
 .chip--enum { background: #10B981; color: #fff; }
 .chip--external { background: #6B7280; color: #fff; }
 .chip--cycle { background: var(--danger); color: #fff; }
+.chip--weight { background: #334155; color: var(--text-secondary); }
+.chip--namespace { background: #0F4C81; color: #93C5FD; }
 .chip--xs { padding: 1px 5px; font-size: 10px; }
 
 /* ===== Detail Panel ===== */
@@ -582,6 +584,10 @@ body {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.detail-metrics--3 {
+  grid-template-columns: 1fr 1fr 1fr;
 }
 
 .metric {
@@ -643,6 +649,75 @@ body {
   border-bottom: none;
 }
 
+.detail-list-item--static {
+  cursor: default;
+}
+
+.detail-list-item--static:hover {
+  color: var(--text-primary);
+}
+
+/* ===== Instability Metric ===== */
+.detail-instability {
+  margin: 12px 0;
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  border-radius: 6px;
+}
+
+.instability-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.instability-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.instability-value {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.instability-bar-bg {
+  height: 4px;
+  background: var(--bg-primary);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.instability-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.instability-hint {
+  margin-top: 5px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.edge-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  padding: 1px 5px;
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
 .edge-type {
   font-size: 10px;
   color: var(--text-muted);
@@ -692,6 +767,22 @@ body {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn--primary:hover {
+  background: #2563EB;
+  border-color: #2563EB;
+}
+
+.btn--full {
+  width: 100%;
+  justify-content: center;
 }
 
 .btn--ghost {

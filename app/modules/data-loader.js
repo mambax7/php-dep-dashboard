@@ -109,6 +109,25 @@ function parseAndProcessInWorker(text) {
 function processWorkerResult({ classesArray, edges, meta, warnings, cycles }) {
   const classMap = new Map(classesArray.map((cls) => [cls.fqcn, cls]));
 
+  // Compute instability per class: I = Ce / (Ca + Ce)
+  // Ce = efferent coupling (fan-out): unique classes this one depends on
+  // Ca = afferent coupling (fan-in): unique classes that depend on this one
+  const fanOut = new Map();
+  const fanIn = new Map();
+  for (const e of edges) {
+    if (!fanOut.has(e.source)) fanOut.set(e.source, new Set());
+    fanOut.get(e.source).add(e.target);
+    if (!fanIn.has(e.target)) fanIn.set(e.target, new Set());
+    fanIn.get(e.target).add(e.source);
+  }
+  for (const cls of classMap.values()) {
+    const ce = (fanOut.get(cls.fqcn) || new Set()).size;
+    const ca = (fanIn.get(cls.fqcn) || new Set()).size;
+    cls.instability = (ce + ca === 0) ? null : parseFloat((ce / (ce + ca)).toFixed(2));
+    cls.fanOut = ce;
+    cls.fanIn = ca;
+  }
+
   const processed = { meta, classes: classMap, edges, warnings, cycles };
 
   state.data = processed;

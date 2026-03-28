@@ -181,6 +181,25 @@ function parseAndProcessInWorker(text) {
 function processWorkerResult({ classesArray, edges, meta, warnings, cycles }) {
   const classMap = new Map(classesArray.map((cls) => [cls.fqcn, cls]));
 
+  // Compute instability per class: I = Ce / (Ca + Ce)
+  // Ce = efferent coupling (fan-out): unique classes this one depends on
+  // Ca = afferent coupling (fan-in): unique classes that depend on this one
+  const fanOut = new Map();
+  const fanIn = new Map();
+  for (const e of edges) {
+    if (!fanOut.has(e.source)) fanOut.set(e.source, new Set());
+    fanOut.get(e.source).add(e.target);
+    if (!fanIn.has(e.target)) fanIn.set(e.target, new Set());
+    fanIn.get(e.target).add(e.source);
+  }
+  for (const cls of classMap.values()) {
+    const ce = (fanOut.get(cls.fqcn) || new Set()).size;
+    const ca = (fanIn.get(cls.fqcn) || new Set()).size;
+    cls.instability = (ce + ca === 0) ? null : parseFloat((ce / (ce + ca)).toFixed(2));
+    cls.fanOut = ce;
+    cls.fanIn = ca;
+  }
+
   const processed = { meta, classes: classMap, edges, warnings, cycles };
 
   state.data = processed;
@@ -384,6 +403,9 @@ function buildNamespaceElementsAtScope(data, scope) {
           depCount: cls.dependencies ? cls.dependencies.length : 0,
           dependantCount: cls.dependants ? cls.dependants.length : 0,
           degree: degree.get(fqcn) || 0,
+          instability: cls.instability,
+          fanOut: cls.fanOut,
+          fanIn: cls.fanIn,
         },
       });
     }
@@ -402,6 +424,24 @@ function buildNamespaceElementsAtScope(data, scope) {
     const key = srcId + '\u2192' + tgtId;
     if (!edgeMap.has(key)) edgeMap.set(key, { source: srcId, target: tgtId, entries: [] });
     edgeMap.get(key).entries.push(e);
+  }
+
+  // Compute namespace-level instability from aggregated edges
+  const nsFanOut = new Map();
+  const nsFanIn = new Map();
+  for (const { source, target } of edgeMap.values()) {
+    nsFanOut.set(source, (nsFanOut.get(source) || 0) + 1);
+    nsFanIn.set(target, (nsFanIn.get(target) || 0) + 1);
+  }
+  for (const node of nodes) {
+    if (node.data.nodeType !== 'namespace') continue;
+    const id = node.data.id;
+    const ce = nsFanOut.get(id) || 0;
+    const ca = nsFanIn.get(id) || 0;
+    const instability = (ce + ca === 0) ? null : parseFloat((ce / (ce + ca)).toFixed(2));
+    node.data.instability = instability;
+    node.data.fanOut = ce;
+    node.data.fanIn = ca;
   }
 
   let ei = 0;
@@ -501,6 +541,9 @@ function buildClassElementsAtScope(data, scope) {
       depCount: cls.dependencies ? cls.dependencies.length : 0,
       dependantCount: cls.dependants ? cls.dependants.length : 0,
       degree: degree.get(cls.fqcn) || 0,
+      instability: cls.instability,
+      fanOut: cls.fanOut,
+      fanIn: cls.fanIn,
     };
     if (nsPath) nodeData.parent = 'ns-container::' + nsPath;
     nodes.push({ data: nodeData });
@@ -654,14 +697,29 @@ function initGraph(data) {
 
   cy.ready(() => runLayout('fcose'));
 
-  cy.on('tap', 'node', (evt) => {
+  // Single tap on namespace → detail panel; double tap → drill down
+  let nsTapTimer = null;
+  cy.on('tap', 'node[nodeType="namespace"]', (evt) => {
     const node = evt.target;
-    const d = node.data();
-    if (d.nodeType === 'namespace') {
-      navigateToScope(d.nsPath);
-      return;
-    }
-    emit('node:selected', node.id());
+    if (nsTapTimer) return; // a second tap is coming (dbltap)
+    nsTapTimer = setTimeout(() => {
+      nsTapTimer = null;
+      cy.elements().removeClass('ns-selected');
+      node.addClass('ns-selected');
+      emit('namespace:selected', node.data());
+    }, 220);
+  });
+
+  cy.on('dbltap', 'node[nodeType="namespace"]', (evt) => {
+    clearTimeout(nsTapTimer);
+    nsTapTimer = null;
+    cy.elements().removeClass('ns-selected');
+    navigateToScope(evt.target.data('nsPath'));
+  });
+
+  cy.on('tap', 'node[nodeType != "namespace"]', (evt) => {
+    cy.elements().removeClass('ns-selected');
+    emit('node:selected', evt.target.id());
   });
 
   cy.on('tap', 'edge', (evt) => {
@@ -677,10 +735,13 @@ function initGraph(data) {
 
   cy.on('tap', (evt) => {
     if (evt.target === cy) {
+      cy.elements().removeClass('ns-selected');
       resetFocus();
       emit('selection:cleared');
     }
   });
+
+  on('namespace:navigate', (nsPath) => navigateToScope(nsPath));
 
   cy.on('mouseover', 'node', (evt) => {
     const node = evt.target;
@@ -1002,6 +1063,14 @@ function buildStylesheet() {
         'background-color': '#1E4D8C',
         'border-color': '#60A5FA',
         'border-width': 3,
+      },
+    },
+    {
+      selector: 'node.ns-selected',
+      style: {
+        'border-color': '#FACC15',
+        'border-width': 3,
+        'background-color': '#1E4D8C',
       },
     },
   ];
@@ -1326,6 +1395,7 @@ function initDetailPanel() {
 
   on('node:selected', (nodeId) => renderNode(nodeId));
   on('edge:selected', (edgeData) => renderEdge(edgeData));
+  on('namespace:selected', (nodeData) => renderNamespace(nodeData));
   on('selection:cleared', () => renderEmpty());
 }
 
@@ -1377,6 +1447,7 @@ function renderNode(nodeId) {
         <span class="metric-label">Dependants (fan-in)</span>
       </div>
     </div>
+    ${cls.instability !== null && cls.instability !== undefined ? renderInstability(cls.instability) : ''}
 
     <div class="detail-section">
       <h4>Focus depth</h4>
@@ -1445,17 +1516,135 @@ function renderNode(nodeId) {
   });
 }
 
+function renderNamespace(nodeData) {
+  const cy = state.cy;
+  const node = cy ? cy.getElementById(nodeData.id) : null;
+
+  // Collect outgoing / incoming namespace edges from the live graph
+  const outEdges = [];
+  const inEdges = [];
+  if (node && !node.empty()) {
+    node.connectedEdges().forEach((edge) => {
+      const d = edge.data();
+      if (edge.source().id() === nodeData.id) outEdges.push(d);
+      else inEdges.push(d);
+    });
+  }
+
+  const instabilityHtml = nodeData.instability !== null && nodeData.instability !== undefined
+    ? renderInstability(nodeData.instability)
+    : '';
+
+  const nsPath = nodeData.nsPath || '';
+  const parentPath = nsPath.includes('\\') ? nsPath.split('\\').slice(0, -1).join('\\') : '';
+
+  const makeEdgeList = (edges, dirKey, dirLabel) => {
+    if (!edges.length) return '';
+    return `
+      <div class="detail-section">
+        <h4>${dirLabel}</h4>
+        <ul class="detail-list">
+          ${edges.map((e) => `
+            <li class="detail-list-item detail-list-item--static">
+              <span class="edge-badge">${e.weight || 1}</span>
+              <span class="edge-target">${shortNs(e[dirKey])}</span>
+              <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
+            </li>
+          `).join('')}
+        </ul>
+      </div>`;
+  };
+
+  panelEl.innerHTML = `
+    <div class="detail-header">
+      <span class="chip chip--namespace">namespace</span>
+      ${nodeData.hasCycle ? '<span class="chip chip--cycle">circular dep</span>' : ''}
+    </div>
+    <h3 class="detail-title">${shortNs(nsPath)}</h3>
+    ${parentPath ? `<p class="detail-file">${parentPath}</p>` : ''}
+
+    <div class="detail-metrics detail-metrics--3">
+      <div class="metric">
+        <span class="metric-value">${nodeData.classCount || 0}</span>
+        <span class="metric-label">Classes</span>
+      </div>
+      <div class="metric">
+        <span class="metric-value">${nodeData.fanOut || 0}</span>
+        <span class="metric-label">Fan-out (Ce)</span>
+      </div>
+      <div class="metric">
+        <span class="metric-value">${nodeData.fanIn || 0}</span>
+        <span class="metric-label">Fan-in (Ca)</span>
+      </div>
+    </div>
+
+    ${instabilityHtml}
+
+    <div class="detail-section">
+      <button class="btn btn--primary btn--full" id="btn-drilldown">
+        Drill down into namespace →
+      </button>
+    </div>
+
+    ${makeEdgeList(outEdges, 'target', 'Depends on')}
+    ${makeEdgeList(inEdges, 'source', 'Depended by')}
+  `;
+
+  panelEl.querySelector('#btn-drilldown').addEventListener('click', () => {
+    emit('namespace:navigate', nsPath);
+  });
+}
+
+function shortNs(nsPath) {
+  if (!nsPath) return '';
+  const parts = nsPath.replace(/^ns::/, '').split('\\');
+  return parts[parts.length - 1];
+}
+
 function renderEdge(edgeData) {
+  const isAggregated = edgeData.weight > 1;
+  const entriesList = isAggregated && edgeData.entries ? `
+    <div class="detail-section">
+      <h4>${edgeData.weight} dependencies</h4>
+      <ul class="detail-list">
+        ${edgeData.entries.map((e) => `
+          <li class="detail-list-item detail-list-item--static">
+            <span class="edge-type">${e.type}</span>
+            <span class="edge-target">${shortName(e.source)} → ${shortName(e.target)}</span>
+            <span class="edge-confidence conf--${e.confidence}">${e.confidence}</span>
+          </li>
+        `).join('')}
+      </ul>
+    </div>` : '';
+
   panelEl.innerHTML = `
     <div class="detail-header">
       <span class="chip">edge</span>
       <span class="edge-confidence conf--${edgeData.confidence}">${edgeData.confidence}</span>
+      ${isAggregated ? `<span class="chip chip--weight">${edgeData.weight} deps</span>` : ''}
     </div>
-    <h3 class="detail-title">${edgeData.type}</h3>
-    <p class="detail-file">${edgeData.file || 'unknown'}${edgeData.line ? ':' + edgeData.line : ''}</p>
     <div class="detail-section">
       <p><strong>From:</strong> ${edgeData.source}</p>
       <p><strong>To:</strong> ${edgeData.target}</p>
+    </div>
+    ${entriesList}
+  `;
+}
+
+function renderInstability(value) {
+  const pct = Math.round(value * 100);
+  const color = value < 0.33 ? '#22C55E' : value < 0.67 ? '#F59E0B' : '#EF4444';
+  const label = value < 0.33 ? 'Stable' : value < 0.67 ? 'Balanced' : 'Unstable';
+  return `
+    <div class="detail-instability">
+      <div class="instability-header">
+        <span class="instability-label">Instability (I)</span>
+        <span class="instability-value" style="color:${color}">${value.toFixed(2)} — ${label}</span>
+      </div>
+      <div class="instability-bar-bg">
+        <div class="instability-bar-fill" style="width:${pct}%;background:${color}"></div>
+      </div>
+      <p class="instability-hint">I = Ce / (Ca + Ce) &nbsp;·&nbsp; 0 = stable, 1 = instable</p>
     </div>
   `;
 }

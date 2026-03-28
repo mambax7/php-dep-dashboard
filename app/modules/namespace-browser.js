@@ -111,6 +111,9 @@ export function buildNamespaceElementsAtScope(data, scope) {
           depCount: cls.dependencies ? cls.dependencies.length : 0,
           dependantCount: cls.dependants ? cls.dependants.length : 0,
           degree: degree.get(fqcn) || 0,
+          instability: cls.instability,
+          fanOut: cls.fanOut,
+          fanIn: cls.fanIn,
         },
       });
     }
@@ -129,6 +132,24 @@ export function buildNamespaceElementsAtScope(data, scope) {
     const key = srcId + '\u2192' + tgtId;
     if (!edgeMap.has(key)) edgeMap.set(key, { source: srcId, target: tgtId, entries: [] });
     edgeMap.get(key).entries.push(e);
+  }
+
+  // Compute namespace-level instability from aggregated edges
+  const nsFanOut = new Map();
+  const nsFanIn = new Map();
+  for (const { source, target } of edgeMap.values()) {
+    nsFanOut.set(source, (nsFanOut.get(source) || 0) + 1);
+    nsFanIn.set(target, (nsFanIn.get(target) || 0) + 1);
+  }
+  for (const node of nodes) {
+    if (node.data.nodeType !== 'namespace') continue;
+    const id = node.data.id;
+    const ce = nsFanOut.get(id) || 0;
+    const ca = nsFanIn.get(id) || 0;
+    const instability = (ce + ca === 0) ? null : parseFloat((ce / (ce + ca)).toFixed(2));
+    node.data.instability = instability;
+    node.data.fanOut = ce;
+    node.data.fanIn = ca;
   }
 
   let ei = 0;
@@ -228,6 +249,9 @@ export function buildClassElementsAtScope(data, scope) {
       depCount: cls.dependencies ? cls.dependencies.length : 0,
       dependantCount: cls.dependants ? cls.dependants.length : 0,
       degree: degree.get(cls.fqcn) || 0,
+      instability: cls.instability,
+      fanOut: cls.fanOut,
+      fanIn: cls.fanIn,
     };
     if (nsPath) nodeData.parent = 'ns-container::' + nsPath;
     nodes.push({ data: nodeData });

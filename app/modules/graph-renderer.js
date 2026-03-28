@@ -47,14 +47,29 @@ export function initGraph(data) {
 
   cy.ready(() => runLayout('fcose'));
 
-  cy.on('tap', 'node', (evt) => {
+  // Single tap on namespace → detail panel; double tap → drill down
+  let nsTapTimer = null;
+  cy.on('tap', 'node[nodeType="namespace"]', (evt) => {
     const node = evt.target;
-    const d = node.data();
-    if (d.nodeType === 'namespace') {
-      navigateToScope(d.nsPath);
-      return;
-    }
-    emit('node:selected', node.id());
+    if (nsTapTimer) return; // a second tap is coming (dbltap)
+    nsTapTimer = setTimeout(() => {
+      nsTapTimer = null;
+      cy.elements().removeClass('ns-selected');
+      node.addClass('ns-selected');
+      emit('namespace:selected', node.data());
+    }, 220);
+  });
+
+  cy.on('dbltap', 'node[nodeType="namespace"]', (evt) => {
+    clearTimeout(nsTapTimer);
+    nsTapTimer = null;
+    cy.elements().removeClass('ns-selected');
+    navigateToScope(evt.target.data('nsPath'));
+  });
+
+  cy.on('tap', 'node[nodeType != "namespace"]', (evt) => {
+    cy.elements().removeClass('ns-selected');
+    emit('node:selected', evt.target.id());
   });
 
   cy.on('tap', 'edge', (evt) => {
@@ -70,10 +85,13 @@ export function initGraph(data) {
 
   cy.on('tap', (evt) => {
     if (evt.target === cy) {
+      cy.elements().removeClass('ns-selected');
       resetFocus();
       emit('selection:cleared');
     }
   });
+
+  on('namespace:navigate', (nsPath) => navigateToScope(nsPath));
 
   cy.on('mouseover', 'node', (evt) => {
     const node = evt.target;
@@ -395,6 +413,14 @@ function buildStylesheet() {
         'background-color': '#1E4D8C',
         'border-color': '#60A5FA',
         'border-width': 3,
+      },
+    },
+    {
+      selector: 'node.ns-selected',
+      style: {
+        'border-color': '#FACC15',
+        'border-width': 3,
+        'background-color': '#1E4D8C',
       },
     },
   ];
